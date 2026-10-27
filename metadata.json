@@ -1,5 +1,8 @@
 {
   "name": "StudyNotes AI",
   "description": "Generate clean, modern educational handouts from any topic using AI. Preview and download as PDF.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

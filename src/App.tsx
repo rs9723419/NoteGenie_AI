@@ -10,6 +10,7 @@ import {
   Eye,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   X,
   Trash2,
   Plus,
@@ -28,7 +29,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import mermaid from 'mermaid';
-import { generateNotes, generateFlowchartSummary } from './services/gemini';
+import { generateNotes, generateFlowchartSummary, getLastGenerationWasOffline, isQuotaOrRateLimitError } from './services/gemini';
+import { generateOfflineNotes, generateOfflineFlowchartSummary } from './services/offlineGenerator';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Resizable } from 're-resizable';
@@ -247,7 +249,7 @@ const MermaidDiagram = ({ chart, previewTheme, baseFontSize }: { chart: string, 
           fixedChart = `graph TD\n${fixedChart}`;
         }
 
-        // 2. Fix unquoted labels, nested quotes, parentheses, and special chars in node shapes
+        // 2. Fix unquoted labels, nested quotes, brackets, and special chars in node shapes
         const sanitizeLabel = (label: string) => {
           let trimmed = label.trim();
           if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
@@ -255,26 +257,45 @@ const MermaidDiagram = ({ chart, previewTheme, baseFontSize }: { chart: string, 
           } else if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
             trimmed = trimmed.slice(1, -1);
           }
+          // Replace any internal double quotes with single quotes
           trimmed = trimmed.replace(/"/g, "'");
+          // Replace square brackets inside label text with round parentheses to avoid breaking Mermaid parser
+          trimmed = trimmed.replace(/\[/g, '(').replace(/\]/g, ')');
           return `"${trimmed.trim()}"`;
         };
 
-        // First, handle double shapes to avoid partial matches
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\{\{\s*([\s\S]*?)\s*\}\}/g, (m, id, label) => `${id}{{${sanitizeLabel(label)}}}`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\(\(\s*([\s\S]*?)\s*\)\)/g, (m, id, label) => `${id}((${sanitizeLabel(label)}))`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\[\[\s*([\s\S]*?)\s*\]\]/g, (m, id, label) => `${id}[[${sanitizeLabel(label)}]]`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\(\[\s*([\s\S]*?)\s*\]\)/g, (m, id, label) => `${id}([${sanitizeLabel(label)}])`);
+        // First, handle double shapes with optional whitespace after ID
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\{\{\s*([\s\S]*?)\s*\}\}/g, (m, id, label) => `${id}{{${sanitizeLabel(label)}}}`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\(\(\s*([\s\S]*?)\s*\)\)/g, (m, id, label) => `${id}((${sanitizeLabel(label)}))`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\[\[\s*([\s\S]*?)\s*\]\]/g, (m, id, label) => `${id}[[${sanitizeLabel(label)}]]`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\(\[\s*([\s\S]*?)\s*\]\)/g, (m, id, label) => `${id}([${sanitizeLabel(label)}])`);
         
-        // Then handle single shapes
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\[\s*((?:[^[\]]+|\[[^[\]]*\])*)\s*\]/g, (m, id, label) => `${id}[${sanitizeLabel(label)}]`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\(\s*((?:[^()]+|\([^()]*\))*)\s*\)/g, (m, id, label) => `${id}(${sanitizeLabel(label)})`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\{\s*([^}]+)\s*\}/g, (m, id, label) => `${id}{${sanitizeLabel(label)}}`);
-        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\>\s*([^\]]+)\s*\]/g, (m, id, label) => `${id}>${sanitizeLabel(label)}]`);
+        // Then handle single shapes with optional whitespace after ID
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\[\s*((?:[^[\]]+|\[[^[\]]*\])*)\s*\]/g, (m, id, label) => `${id}[${sanitizeLabel(label)}]`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\(\s*((?:[^()]+|\([^()]*\))*)\s*\)/g, (m, id, label) => `${id}(${sanitizeLabel(label)})`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\{\s*([^}]+)\s*\}/g, (m, id, label) => `${id}{${sanitizeLabel(label)}}`);
+        fixedChart = fixedChart.replace(/([a-zA-Z0-9_-]+)\s*\>\s*([^\]]+)\s*\]/g, (m, id, label) => `${id}>${sanitizeLabel(label)}]`);
 
         const { svg } = await mermaid.render(id, fixedChart);
         setSvg(svg);
       } catch (err) {
-        console.error('Mermaid render error:', err);
+        console.warn('Initial Mermaid render attempt failed, attempting fallback cleanup:', err);
+        // Clean up any error element injected into DOM by Mermaid
+        document.querySelectorAll('[id^="dmermaid-"]').forEach(el => el.remove());
+        
+        try {
+          // Fallback: strip any remaining interior punctuation quotes
+          const fallbackChart = chart
+            .split('\n')
+            .map(line => line.replace(/"([^"]*)"/g, (m, inner) => `"${inner.replace(/["'[\]{}]/g, ' ')}"`))
+            .join('\n');
+          const fallbackId = `mermaid-fb-${Math.random().toString(36).substr(2, 9)}`;
+          const { svg } = await mermaid.render(fallbackId, fallbackChart);
+          setSvg(svg);
+        } catch (fallbackErr) {
+          console.warn('Mermaid rendering could not parse diagram syntax cleanly:', fallbackErr);
+          document.querySelectorAll('[id^="dmermaid-"]').forEach(el => el.remove());
+        }
       }
     };
 
@@ -457,6 +478,7 @@ export default function App() {
   const [isPrintFriendly, setIsPrintFriendly] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [copied, setCopied] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   
@@ -502,18 +524,39 @@ export default function App() {
     setTheme(prev => prev === 'light' ? 'dark' : 'light');
   };
 
-  const handleGenerate = async () => {
+  const handleGenerate = async (forceOffline: boolean = false) => {
     if (!topic) return;
     setIsGenerating(true);
     setProgress(0);
     setNotes(null);
     setNoteBlocks([]);
     setError(null);
+    if (!forceOffline) {
+      setIsOfflineMode(false);
+    }
     
     // Create new abort controller for this request
     abortControllerRef.current = new AbortController();
     
     try {
+      if (forceOffline) {
+        setIsOfflineMode(true);
+        const offlineResult = await generateOfflineNotes({
+          topic,
+          details,
+          includeDiagrams,
+          fullCode,
+          fromScratch: separateCode,
+          onProgress: (p) => setProgress(p),
+        });
+        if (abortControllerRef.current?.signal.aborted) return;
+        setNotes(offlineResult);
+        setNoteBlocks(parseNotesToBlocks(offlineResult));
+        setShowPreview(true);
+        setError(null);
+        return;
+      }
+
       const result = await generateNotes(
         topic, 
         details, 
@@ -522,15 +565,41 @@ export default function App() {
         separateCode,
         (p) => setProgress(p), 
         undefined, // onChunk
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
+        () => setIsOfflineMode(true)
       );
       if (abortControllerRef.current?.signal.aborted) return;
+      if (getLastGenerationWasOffline()) {
+        setIsOfflineMode(true);
+      }
       setNotes(result);
       setNoteBlocks(parseNotesToBlocks(result));
       setShowPreview(true);
+      setError(null);
     } catch (err) {
       if (err instanceof Error && (err.name === 'AbortError' || err.message === 'AbortError')) return;
-      console.error('Generation failed:', err);
+      console.warn('Generation encountered error, checking quota fallback:', err);
+      if (isQuotaOrRateLimitError(err)) {
+        setIsOfflineMode(true);
+        try {
+          const offlineResult = await generateOfflineNotes({
+            topic,
+            details,
+            includeDiagrams,
+            fullCode,
+            fromScratch: separateCode,
+            onProgress: (p) => setProgress(p),
+          });
+          if (abortControllerRef.current?.signal.aborted) return;
+          setNotes(offlineResult);
+          setNoteBlocks(parseNotesToBlocks(offlineResult));
+          setShowPreview(true);
+          setError(null);
+          return;
+        } catch (offlineErr) {
+          console.error('Offline fallback failed:', offlineErr);
+        }
+      }
       setError(err instanceof Error ? err.message : 'An unexpected error occurred during generation.');
     } finally {
       setIsGenerating(false);
@@ -591,7 +660,32 @@ export default function App() {
 
     } catch (err) {
       if (err instanceof Error && (err.name === 'AbortError' || err.message === 'AbortError')) return;
-      console.error('Summary generation failed:', err);
+      console.warn('Summary generation error, checking quota fallback:', err);
+      if (isQuotaOrRateLimitError(err)) {
+        setIsOfflineMode(true);
+        try {
+          const offlineSummary = await generateOfflineFlowchartSummary(
+            topic, 
+            noteBlocks.map(b => b.content).join('\n'), 
+            (p) => setProgress(p)
+          );
+          const newBlock: NoteBlock = {
+            id: `summary-${Date.now()}`,
+            type: 'text',
+            content: `## 🗺️ Visual Topic Map: ${topic}\n\n> High-level mental map structured offline.\n\n${offlineSummary}`
+          };
+          setNoteBlocks(prev => [...prev, newBlock]);
+          setTimeout(() => {
+            const container = document.querySelector('.preview-scroll-container');
+            if (container) {
+              container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+            }
+          }, 100);
+          return;
+        } catch (offlineErr) {
+          console.error('Offline summary failed:', offlineErr);
+        }
+      }
       setError(err instanceof Error ? err.message : 'An unexpected error occurred during summary generation.');
     } finally {
       setIsGenerating(false);
@@ -1782,18 +1876,48 @@ export default function App() {
               <motion.div 
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="p-4 rounded-2xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-medium flex gap-3 items-start"
+                className={cn(
+                  "p-5 rounded-2xl border text-sm font-medium flex gap-3.5 items-start transition-all",
+                  error.toLowerCase().includes('rate limit') || error.toLowerCase().includes('quota') || error.toLowerCase().includes('429')
+                    ? "bg-amber-500/10 border-amber-500/30 text-amber-900 dark:text-amber-200"
+                    : "bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400"
+                )}
               >
-                <AlertCircle className="shrink-0 mt-0.5" size={18} />
-                <div className="space-y-1">
-                  <p className="font-bold">Something went wrong</p>
-                  <p className="opacity-90">{error}</p>
-                  <button 
-                    onClick={() => handleGenerate()}
-                    className="mt-2 text-xs font-bold underline hover:no-underline"
-                  >
-                    Try Again
-                  </button>
+                {error.toLowerCase().includes('rate limit') || error.toLowerCase().includes('quota') || error.toLowerCase().includes('429') ? (
+                  <AlertTriangle className="shrink-0 mt-0.5 text-amber-500" size={20} />
+                ) : (
+                  <AlertCircle className="shrink-0 mt-0.5" size={20} />
+                )}
+                <div className="space-y-1.5 flex-1">
+                  <p className="font-bold text-base">
+                    {error.toLowerCase().includes('rate limit') || error.toLowerCase().includes('quota') || error.toLowerCase().includes('429')
+                      ? "Rate Limit / Quota Notice"
+                      : "Something went wrong"}
+                  </p>
+                  <p className="opacity-90 leading-relaxed">{error}</p>
+                  <div className="flex items-center gap-3 pt-2">
+                    <button 
+                      onClick={() => handleGenerate(false)}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-95 flex items-center gap-2"
+                    >
+                      <RefreshCw size={13} />
+                      Try Again
+                    </button>
+                    <button 
+                      onClick={() => handleGenerate(true)}
+                      className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-95 flex items-center gap-2"
+                      title="Generate complete structured study material offline immediately"
+                    >
+                      <Zap size={13} className="fill-current" />
+                      Generate Offline
+                    </button>
+                    <button 
+                      onClick={() => setError(null)}
+                      className="px-3 py-2 text-xs font-medium opacity-70 hover:opacity-100 transition-opacity"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -1843,6 +1967,41 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 className="h-full flex flex-col"
               >
+                {isOfflineMode && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mb-4 mx-4 px-4 py-3 rounded-2xl bg-gradient-to-r from-amber-500/15 via-blue-500/10 to-indigo-500/15 border border-amber-500/30 dark:border-amber-400/20 text-neutral-800 dark:text-neutral-100 flex flex-wrap items-center justify-between gap-3 shadow-sm no-print"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="px-2.5 py-1 rounded-lg bg-amber-500 text-white font-black text-xs tracking-wide shadow-xs flex items-center gap-1.5">
+                        <Zap size={13} className="fill-current" />
+                        SMART OFFLINE MODE
+                      </span>
+                      <div className="text-xs sm:text-sm">
+                        <span className="font-semibold text-amber-700 dark:text-amber-300">Gemini API quota reached.</span>
+                        <span className="opacity-90 ml-1">High-quality structured notes, diagrams, and code were auto-generated locally. Full editing & PDF tools are active.</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 ml-auto">
+                      <button
+                        onClick={() => handleGenerate(false)}
+                        disabled={isGenerating}
+                        className="px-3 py-1.5 rounded-xl bg-white dark:bg-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-700 text-xs font-semibold text-neutral-700 dark:text-neutral-200 border border-neutral-200 dark:border-neutral-700 transition-all flex items-center gap-1.5 shadow-2xs active:scale-95"
+                      >
+                        <RefreshCw size={12} className={cn(isGenerating && "animate-spin")} />
+                        Retry Online
+                      </button>
+                      <button
+                        onClick={() => setIsOfflineMode(false)}
+                        className="p-1 rounded-lg text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 transition-colors"
+                        title="Dismiss notice"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
                 <div className="flex justify-between items-center mb-6 px-4">
                   <h3 className="font-display font-bold flex items-center gap-3 text-xl">
                     <div className={cn(

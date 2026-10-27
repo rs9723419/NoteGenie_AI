@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan to automatically generate comprehensive structured study materials offline whenever Gemini API quota or rate limits are reached, eliminating 429 error crashes while keeping note preview, editing, diagramming, and exporting fully functional.",
+  "updatedAt":  "2026-10-27T16:54:19.320618131Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
